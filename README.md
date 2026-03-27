@@ -43,6 +43,9 @@ python cli.py example.com --verbose
 
 # Adjust rate limit (default: 1 query/sec/server)
 python cli.py --file domains.txt --rate 2
+
+# Watch a domain until it becomes available (check every 5 minutes)
+python cli.py expiring-domain.com --watch 300
 ```
 
 ## Example output
@@ -50,18 +53,35 @@ python cli.py --file domains.txt --rate 2
 ```
 $ python cli.py google.com notregistered12345.com example.co.uk
 
-┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━┓
-┃ Domain                 ┃ Available ┃ Registrar      ┃ Expires    ┃ Status                         ┃ Via  ┃
-┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━┩
-│ google.com             │ No        │ MarkMonitor    │ 2028-09-14 │ client delete prohibited,      │ rdap │
-│                        │           │ Inc.           │            │ client transfer prohibited,    │      │
-│                        │           │                │            │ client update prohibited       │      │
-│ notregistered12345.com │ Yes       │                │            │                                │ rdap │
-│ example.co.uk          │ No        │ Nominet UK     │            │ server delete prohibited,      │ rdap │
-│                        │           │                │            │ server update prohibited,      │      │
-│                        │           │                │            │ server transfer prohibited     │      │
-└────────────────────────┴───────────┴────────────────┴────────────┴────────────────────────────────┴──────┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━┓
+┃ Domain                 ┃ Available ┃ Owner  ┃ Registrar      ┃ Expires (YYYY-MM-DD) ┃ Status                ┃ Via  ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━┩
+│ google.com             │ No        │ hidden │ MarkMonitor    │ 2028-09-14           │ client delete         │ rdap │
+│                        │           │        │ Inc.           │                      │ prohibited, client    │      │
+│                        │           │        │                │                      │ transfer prohibited   │      │
+│ notregistered12345.com │ Yes       │        │                │                      │                       │ rdap │
+│ example.co.uk          │ No        │ PRIVATE│ Nominet UK     │                      │ server delete         │ rdap │
+│                        │           │        │                │                      │ prohibited, server    │      │
+│                        │           │        │                │                      │ transfer prohibited   │      │
+└────────────────────────┴───────────┴────────┴────────────────┴──────────────────────┴───────────────────────┴──────┘
 ```
+
+### Watch mode
+
+Monitor a pendingDelete or expiring domain and get notified the moment it drops:
+
+```
+$ python cli.py getcounted.us --watch 300
+
+Watching getcounted.us every 5m. Ctrl+C to stop.
+
+  #1  2026-03-27 01:55:22  not available  pendingdelete
+  #2  2026-03-27 02:00:22  not available  pendingdelete
+  #3  2026-03-27 02:05:22  not available  pendingdelete
+  #4  2026-03-27 02:10:22  AVAILABLE — getcounted.us is ready to register!
+```
+
+Sends a Windows toast notification (WSL2) or `notify-send` (Linux desktop) when the domain becomes available.
 
 ## How it works
 
@@ -77,9 +97,11 @@ $ python cli.py google.com notregistered12345.com example.co.uk
 
 ## What it reports
 
-For registered domains: registrar, creation date, expiry date, and EPP status codes (e.g., `clientTransferProhibited`, `redemptionPeriod`, `pendingDelete`).
+For registered domains: registrant/owner (when visible), registrar, creation date, expiry date (YYYY-MM-DD), and EPP status codes (e.g., `clientTransferProhibited`, `redemptionPeriod`, `pendingDelete`).
 
-Domains in `redemptionPeriod` or `pendingDelete` are flagged — they're registered but may become available soon.
+The **Owner** column shows the actual registrant name and organization when the registry exposes it. Most gTLD registrations post-GDPR show `PRIVATE` (behind a privacy proxy) or `hidden` (thin registry like Verisign where registrant data isn't in the response at all). Some ccTLDs (`.us`, `.uk`, `.au`) still expose registrant info.
+
+Domains in `redemptionPeriod` or `pendingDelete` are flagged — they're registered but may become available soon. Use `--watch` to monitor them.
 
 ## Limitations
 

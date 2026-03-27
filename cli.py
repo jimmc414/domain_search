@@ -9,7 +9,9 @@ import csv
 import io
 import json
 import logging
+import subprocess
 import sys
+from datetime import datetime
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn
@@ -64,6 +66,12 @@ def main() -> None:
         default=10.0,
         help="Per-query timeout in seconds (default: 10)",
     )
+    parser.add_argument(
+        "--watch", "-w",
+        type=int,
+        metavar="SECONDS",
+        help="Watch mode: re-check every N seconds until available, then alert (e.g. --watch 300)",
+    )
 
     args = parser.parse_args()
 
@@ -90,6 +98,14 @@ def main() -> None:
             level=logging.DEBUG,
             format="%(name)s: %(message)s",
         )
+
+    # Watch mode
+    if args.watch:
+        if len(domains) != 1:
+            console.print("[red]--watch only supports a single domain[/red]")
+            sys.exit(1)
+        asyncio.run(_watch(domains[0], args.watch, args.rate))
+        return
 
     # Run
     results = asyncio.run(_run(domains, args.rate))
@@ -135,6 +151,96 @@ async def _run(domains: list[str], rate: float) -> list[DomainResult]:
         key=lambda r: domain_order.get(r.domain.lower(), len(domains))
     )
     return results
+
+
+async def _watch(domain: str, interval: int, rate: float) -> None:
+    """Poll a domain until it becomes available, then alert."""
+    console.print(
+        f"[bold]Watching [cyan]{domain}[/cyan] every "
+        f"{_format_interval(interval)}. Ctrl+C to stop.[/bold]\n"
+    )
+
+    check_num = 0
+    async with DomainChecker(rate=rate) as checker:
+        try:
+            while True:
+                check_num += 1
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                result = await checker.check(domain)
+
+                status_parts = []
+                if result.error:
+                    status_parts.append(f"[yellow]error: {result.error}[/yellow]")
+                elif result.available is True:
+                    # Domain is available!
+                    console.print(
+                        f"  [bold green]#{check_num}  {now}  AVAILABLE — {domain} is ready to register![/bold green]"
+                    )
+                    console.print()
+                    # Terminal bell
+                    print("\a", end="", flush=True)
+                    _send_notification(domain)
+                    return
+                else:
+                    tag = ", ".join(result.statuses[:2]) if result.statuses else "registered"
+                    status_parts.append(f"[dim]{tag}[/dim]")
+
+                console.print(
+                    f"  [dim]#{check_num}  {now}[/dim]  [red]not available[/red]  {' '.join(status_parts)}"
+                )
+                await asyncio.sleep(interval)
+        except KeyboardInterrupt:
+            console.print(f"\n[bold]Stopped watching {domain}.[/bold]")
+
+
+def _format_interval(seconds: int) -> str:
+    """Human-readable interval string."""
+    if seconds >= 3600 and seconds % 3600 == 0:
+        h = seconds // 3600
+        return f"{h}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        m = seconds // 60
+        return f"{m}m"
+    return f"{seconds}s"
+
+
+def _send_notification(domain: str) -> None:
+    """Send a desktop notification (best-effort, WSL2 + Linux)."""
+    title = "Domain Available!"
+    body = f"{domain} is available for registration"
+
+    # Try WSL2 toast via PowerShell
+    try:
+        ps_cmd = (
+            f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
+            f"ContentType = WindowsRuntime] > $null; "
+            f"$template = [Windows.UI.Notifications.ToastNotificationManager]::"
+            f"GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); "
+            f"$text = $template.GetElementsByTagName('text'); "
+            f"$text.Item(0).AppendChild($template.CreateTextNode('{title}')) > $null; "
+            f"$text.Item(1).AppendChild($template.CreateTextNode('{body}')) > $null; "
+            f"$toast = [Windows.UI.Notifications.ToastNotification]::new($template); "
+            f"[Windows.UI.Notifications.ToastNotificationManager]::"
+            f"CreateToastNotifier('Domain Search').Show($toast)"
+        )
+        subprocess.Popen(
+            ["powershell.exe", "-Command", ps_cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    except FileNotFoundError:
+        pass
+
+    # Try notify-send (Linux desktop)
+    try:
+        subprocess.Popen(
+            ["notify-send", "--urgency=critical", title, body],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
 
 
 def _output_table(results: list[DomainResult], verbose: bool) -> None:
