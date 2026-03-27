@@ -35,6 +35,12 @@ class DomainChecker:
         if self._session:
             await self._session.close()
 
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        """Expose session for registrar client reuse."""
+        assert self._session is not None
+        return self._session
+
     async def check(self, raw_domain: str) -> DomainResult:
         """Check a single domain's availability."""
         assert self._rdap is not None and self._whois is not None

@@ -178,3 +178,10 @@ BOOTSTRAP_CACHE_TTL_HOURS = 24
 # Network timeouts (seconds)
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 10
+
+# Porkbun API
+PORKBUN_API_BASE = "https://api.porkbun.com/api/json/v3"
+PORKBUN_RATE_LIMIT = 0.1  # 1 request per 10 seconds
+
+# Registration safety
+DEFAULT_MAX_PRICE = 20.00  # USD — refuses premium domains unless overridden

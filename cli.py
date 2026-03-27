@@ -15,11 +15,11 @@ from datetime import datetime, timedelta
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from checker import DomainChecker
 from models import DomainResult
-
 
 console = Console()
 
@@ -32,7 +32,9 @@ def main() -> None:
         "  python cli.py example.com example.org foo.co.uk\n"
         "  python cli.py --file domains.txt --format json\n"
         "  python cli.py --suggest cloud\n"
-        '  python cli.py --suggest cloud --tlds com,io,dev\n',
+        "  python cli.py --suggest cloud --tlds com,io,dev\n"
+        "  python cli.py coolstartup.dev --register\n"
+        '  python cli.py expiring.com --watch 300 --register --auto-register --max-price 15\n',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -90,6 +92,23 @@ def main() -> None:
         action="store_true",
         help="With --suggest, only show available domains",
     )
+    # Registration flags
+    parser.add_argument(
+        "--register",
+        action="store_true",
+        help="Enable domain registration via Porkbun for available domains",
+    )
+    parser.add_argument(
+        "--auto-register",
+        action="store_true",
+        help="Skip confirmation prompt (required for unattended --watch + --register)",
+    )
+    parser.add_argument(
+        "--max-price",
+        type=float,
+        default=None,
+        help="Max registration price in USD (default: 20.00, protects against premium domains)",
+    )
 
     args = parser.parse_args()
 
@@ -113,6 +132,20 @@ def main() -> None:
             format="%(name)s: %(message)s",
         )
 
+    # Validate registration flags
+    if args.auto_register and not args.register:
+        console.print("[red]--auto-register requires --register[/red]")
+        sys.exit(1)
+
+    # Load registrar config if needed
+    registrar_config = None
+    if args.register:
+        from config import load_registrar_config, credentials_help
+        registrar_config = load_registrar_config(max_price=args.max_price)
+        if not registrar_config:
+            console.print(f"[red]{credentials_help()}[/red]")
+            sys.exit(1)
+
     if not domains and not args.suggest:
         parser.print_help()
         sys.exit(1)
@@ -120,7 +153,10 @@ def main() -> None:
     # Suggest mode
     if args.suggest:
         tlds = args.tlds.split(",") if args.tlds else None
-        asyncio.run(_suggest(args.suggest, tlds, args.rate, args.format, args.verbose, args.available_only))
+        asyncio.run(_suggest(
+            args.suggest, tlds, args.rate, args.format, args.verbose,
+            args.available_only, registrar_config, args.auto_register,
+        ))
         return
 
     # Watch mode
@@ -128,7 +164,16 @@ def main() -> None:
         if len(domains) != 1:
             console.print("[red]--watch only supports a single domain[/red]")
             sys.exit(1)
-        asyncio.run(_watch(domains[0], args.watch, args.rate))
+        if args.register and not args.auto_register:
+            console.print(
+                "[yellow]Note: --watch + --register without --auto-register "
+                "means you must be present to confirm registration.[/yellow]\n"
+            )
+        asyncio.run(_watch(
+            domains[0], args.watch, args.rate,
+            registrar_config=registrar_config,
+            auto_register=args.auto_register,
+        ))
         return
 
     # Run
@@ -142,6 +187,14 @@ def main() -> None:
     else:
         _output_table(results, args.verbose)
 
+    # Offer registration for available domains
+    if registrar_config:
+        available = [r for r in results if r.available is True]
+        if available:
+            asyncio.run(_offer_registration(
+                available, registrar_config, args.auto_register,
+            ))
+
 
 async def _run(domains: list[str], rate: float) -> list[DomainResult]:
     """Run domain checks with progress display."""
@@ -149,12 +202,10 @@ async def _run(domains: list[str], rate: float) -> list[DomainResult]:
 
     async with DomainChecker(rate=rate) as checker:
         if len(domains) == 1:
-            # Single domain — no progress bar needed
             with console.status(f"Checking {domains[0]}..."):
                 result = await checker.check(domains[0])
             results.append(result)
         else:
-            # Bulk — show progress
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -169,7 +220,6 @@ async def _run(domains: list[str], rate: float) -> list[DomainResult]:
                     results.append(result)
                     progress.update(task, advance=1)
 
-    # Sort results to match input order
     domain_order = {d.lower(): i for i, d in enumerate(domains)}
     results.sort(
         key=lambda r: domain_order.get(r.domain.lower(), len(domains))
@@ -177,15 +227,122 @@ async def _run(domains: list[str], rate: float) -> list[DomainResult]:
     return results
 
 
-async def _watch(domain: str, interval: int, rate: float) -> None:
-    """Poll a domain until it becomes available, then alert."""
+# ---------------------------------------------------------------------------
+# Registration helpers
+# ---------------------------------------------------------------------------
+
+async def _init_registrar(session, config):
+    """Create and validate a PorkbunClient."""
+    from registrar import PorkbunClient
+    client = PorkbunClient(session, config.api_key, config.secret_key)
+    with console.status("Validating Porkbun credentials..."):
+        ok = await client.ping()
+    if not ok:
+        console.print("[red]Porkbun authentication failed. Check your API key and secret.[/red]")
+        return None
+    console.print("[green]Porkbun credentials verified.[/green]\n")
+    return client
+
+
+async def _try_register(client, domain: str, max_price: float, auto: bool) -> bool:
+    """Price check + optional register for a single domain. Returns True if registered."""
+    # Price check
+    pricing = await client.get_pricing(domain)
+    if pricing.error:
+        console.print(f"  [red]Could not get pricing for {domain}: {pricing.error}[/red]")
+        return False
+
+    price = pricing.registration_price
+    if price is None:
+        console.print(f"  [red]No pricing available for {domain}[/red]")
+        return False
+
+    renewal = pricing.renewal_price
+    price_info = f"${price:.2f}/yr"
+    if renewal and renewal != price:
+        price_info += f" (renews at ${renewal:.2f}/yr)"
+
+    # Max price guard
+    if price > max_price:
+        console.print(
+            f"  [yellow]{domain} costs {price_info} — exceeds --max-price ${max_price:.2f}, skipping[/yellow]"
+        )
+        return False
+
+    # Confirm
+    if not auto:
+        confirmed = Confirm.ask(
+            f"  Register [cyan]{domain}[/cyan] for {price_info} via Porkbun?",
+            default=False,
+        )
+        if not confirmed:
+            return False
+    else:
+        console.print(f"  Auto-registering [cyan]{domain}[/cyan] for {price_info}...")
+
+    # Register
+    result = await client.register(domain)
+    if result.success:
+        console.print(f"  [bold green]Registered {domain} for {price_info} via Porkbun[/bold green]")
+        return True
+    else:
+        console.print(f"  [red]Registration failed for {domain}: {result.error}[/red]")
+        return False
+
+
+async def _offer_registration(available, config, auto_register):
+    """Offer to register available domains after a normal check."""
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        client = await _init_registrar(session, config)
+        if not client:
+            return
+
+        console.print("[bold]Registration:[/bold]")
+        for r in available:
+            await _try_register(client, r.domain, config.max_price, auto_register)
+
+
+# ---------------------------------------------------------------------------
+# Watch mode
+# ---------------------------------------------------------------------------
+
+async def _watch(
+    domain: str,
+    interval: int,
+    rate: float,
+    registrar_config=None,
+    auto_register: bool = False,
+) -> None:
+    """Poll a domain until it becomes available, then alert (and optionally register)."""
     console.print(
         f"[bold]Watching [cyan]{domain}[/cyan] every "
-        f"{_format_interval(interval)}. Ctrl+C to stop.[/bold]\n"
+        f"{_format_interval(interval)}. Ctrl+C to stop.[/bold]"
     )
+    if registrar_config:
+        mode = "auto-register" if auto_register else "prompt to register"
+        console.print(
+            f"[bold]Registration enabled ({mode}, max ${registrar_config.max_price:.2f})[/bold]"
+        )
+    console.print()
 
     check_num = 0
     async with DomainChecker(rate=rate) as checker:
+        # Validate registrar credentials upfront
+        registrar_client = None
+        if registrar_config:
+            from registrar import PorkbunClient
+            registrar_client = PorkbunClient(
+                checker.session, registrar_config.api_key, registrar_config.secret_key
+            )
+            with console.status("Validating Porkbun credentials..."):
+                ok = await registrar_client.ping()
+            if not ok:
+                console.print("[red]Porkbun authentication failed. Watching without registration.[/red]\n")
+                registrar_client = None
+            else:
+                console.print("[green]Porkbun credentials verified.[/green]\n")
+
         try:
             while True:
                 check_num += 1
@@ -196,22 +353,32 @@ async def _watch(domain: str, interval: int, rate: float) -> None:
                 if result.error:
                     status_parts.append(f"[yellow]error: {result.error}[/yellow]")
                 elif result.available is True:
-                    # Domain is available!
                     console.print(
                         f"  [bold green]#{check_num}  {now}  AVAILABLE — {domain} is ready to register![/bold green]"
                     )
                     console.print()
-                    # Terminal bell
                     print("\a", end="", flush=True)
                     _send_notification(domain)
-                    return
+
+                    # Try registration
+                    if registrar_client and registrar_config:
+                        registered = await _try_register(
+                            registrar_client, domain, registrar_config.max_price, auto_register
+                        )
+                        if registered:
+                            return
+                        # Registration failed — continue watching
+                        console.print("  [yellow]Continuing to watch...[/yellow]\n")
+                    else:
+                        return
                 else:
                     tag = ", ".join(result.statuses[:2]) if result.statuses else "registered"
                     status_parts.append(f"[dim]{tag}[/dim]")
 
-                console.print(
-                    f"  [dim]#{check_num}  {now}[/dim]  [red]not available[/red]  {' '.join(status_parts)}"
-                )
+                if status_parts:
+                    console.print(
+                        f"  [dim]#{check_num}  {now}[/dim]  [red]not available[/red]  {' '.join(status_parts)}"
+                    )
                 await asyncio.sleep(interval)
         except KeyboardInterrupt:
             console.print(f"\n[bold]Stopped watching {domain}.[/bold]")
@@ -220,11 +387,9 @@ async def _watch(domain: str, interval: int, rate: float) -> None:
 def _format_interval(seconds: int) -> str:
     """Human-readable interval string."""
     if seconds >= 3600 and seconds % 3600 == 0:
-        h = seconds // 3600
-        return f"{h}h"
+        return f"{seconds // 3600}h"
     if seconds >= 60 and seconds % 60 == 0:
-        m = seconds // 60
-        return f"{m}m"
+        return f"{seconds // 60}m"
     return f"{seconds}s"
 
 
@@ -233,7 +398,6 @@ def _send_notification(domain: str) -> None:
     title = "Domain Available!"
     body = f"{domain} is available for registration"
 
-    # Try WSL2 toast via PowerShell
     try:
         ps_cmd = (
             f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
@@ -256,7 +420,6 @@ def _send_notification(domain: str) -> None:
     except FileNotFoundError:
         pass
 
-    # Try notify-send (Linux desktop)
     try:
         subprocess.Popen(
             ["notify-send", "--urgency=critical", title, body],
@@ -267,6 +430,10 @@ def _send_notification(domain: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Suggest mode
+# ---------------------------------------------------------------------------
+
 async def _suggest(
     keyword: str,
     tlds: list[str] | None,
@@ -274,13 +441,14 @@ async def _suggest(
     fmt: str,
     verbose: bool,
     available_only: bool,
+    registrar_config=None,
+    auto_register: bool = False,
 ) -> None:
     """Generate domain name candidates and check availability."""
     from suggest import generate_candidates
 
     candidates = generate_candidates(keyword, tlds=tlds)
     tld_label = ",".join(tlds) if tlds else "popular TLDs"
-    # Use stderr for status messages so JSON/CSV stdout stays clean
     err = Console(stderr=True) if fmt in ("json", "csv") else console
     err.print(
         f"[bold]Generating domains for [cyan]{keyword}[/cyan] "
@@ -304,51 +472,99 @@ async def _suggest(
                 results.append(result)
                 progress.update(task, advance=1)
 
-    # Sort: available first, then by domain length
-    results.sort(key=lambda r: (
-        0 if r.available is True else 1,
-        len(r.domain),
-        r.domain,
-    ))
+        # Sort: available first, then by domain length
+        results.sort(key=lambda r: (
+            0 if r.available is True else 1,
+            len(r.domain),
+            r.domain,
+        ))
 
-    if available_only:
-        results = [r for r in results if r.available is True]
+        if available_only:
+            results = [r for r in results if r.available is True]
 
-    if not results:
-        console.print("[yellow]No available domains found.[/yellow]")
+        if not results:
+            console.print("[yellow]No available domains found.[/yellow]")
+            return
+
+        if fmt == "json":
+            _output_json(results, verbose)
+        elif fmt == "csv":
+            _output_csv(results)
+        else:
+            available = [r for r in results if r.available is True]
+            taken = [r for r in results if r.available is not True]
+
+            if available:
+                console.print(f"[bold green]Available ({len(available)}):[/bold green]")
+                table = Table(show_header=False, box=None, padding=(0, 2))
+                table.add_column(style="green bold")
+                table.add_column(style="dim")
+                for i, r in enumerate(available, 1):
+                    prefix = f"  {i}." if registrar_config else "  "
+                    table.add_row(f"{prefix} {r.domain}", r.protocol_used)
+                console.print(table)
+
+            if taken and not available_only:
+                console.print(f"\n[dim]Taken ({len(taken)}): {', '.join(r.domain for r in taken[:20])}", end="")
+                if len(taken) > 20:
+                    console.print(f" ... and {len(taken) - 20} more", end="")
+                console.print("[/dim]")
+
+            if available:
+                console.print(
+                    f"\n[bold]{len(available)} of {len(candidates)} "
+                    f"candidates available[/bold]"
+                )
+
+        # Registration for suggest mode
+        if registrar_config and fmt == "table":
+            available = [r for r in results if r.available is True]
+            if available:
+                registrar_client = await _init_registrar(checker.session, registrar_config)
+                if registrar_client:
+                    await _suggest_register(
+                        registrar_client, available, registrar_config.max_price, auto_register
+                    )
+
+
+async def _suggest_register(client, available, max_price, auto_register):
+    """Handle registration selection from suggest mode results."""
+    if auto_register:
+        console.print("\n[bold]Auto-registering all available domains under max price:[/bold]")
+        for r in available:
+            await _try_register(client, r.domain, max_price, auto=True)
         return
 
-    if fmt == "json":
-        _output_json(results, verbose)
-    elif fmt == "csv":
-        _output_csv(results)
-    else:
-        # Compact table for suggest mode
-        available = [r for r in results if r.available is True]
-        taken = [r for r in results if r.available is not True]
+    console.print()
+    selection = Prompt.ask(
+        "Enter numbers to register (e.g. 1,3,5) or Enter to skip",
+        default="",
+    )
+    if not selection.strip():
+        return
 
-        if available:
-            console.print(f"[bold green]Available ({len(available)}):[/bold green]")
-            table = Table(show_header=False, box=None, padding=(0, 2))
-            table.add_column(style="green bold")
-            table.add_column(style="dim")
-            # Show in columns — group by base name
-            for r in available:
-                table.add_row(r.domain, r.protocol_used)
-            console.print(table)
+    indices = set()
+    for part in selection.split(","):
+        part = part.strip()
+        try:
+            idx = int(part) - 1
+            if 0 <= idx < len(available):
+                indices.add(idx)
+        except ValueError:
+            continue
 
-        if taken and not available_only:
-            console.print(f"\n[dim]Taken ({len(taken)}): {', '.join(r.domain for r in taken[:20])}", end="")
-            if len(taken) > 20:
-                console.print(f" ... and {len(taken) - 20} more", end="")
-            console.print("[/dim]")
+    if not indices:
+        console.print("[yellow]No valid selections.[/yellow]")
+        return
 
-        if available:
-            console.print(
-                f"\n[bold]{len(available)} of {len(candidates)} "
-                f"candidates available[/bold]"
-            )
+    console.print()
+    for idx in sorted(indices):
+        await _try_register(client, available[idx].domain, max_price, auto=False)
 
+
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
 
 def _output_table(results: list[DomainResult], verbose: bool) -> None:
     """Print results as a rich table."""
@@ -396,7 +612,6 @@ def _output_table(results: list[DomainResult], verbose: bool) -> None:
 
     console.print(table)
 
-    # Print status legend if any domain has notable statuses
     statuses_seen = set()
     for r in results:
         for s in r.statuses:
@@ -411,7 +626,6 @@ def _output_table(results: list[DomainResult], verbose: bool) -> None:
 
 
 def _format_owner(r: DomainResult) -> str:
-    """Format the owner/registrant column."""
     if r.available is True or r.available is None:
         return ""
     if r.privacy_protected is True:
@@ -427,14 +641,6 @@ def _format_owner(r: DomainResult) -> str:
 
 
 def _estimate_release(r: DomainResult) -> str:
-    """Estimate when a domain might become available based on status and expiry.
-
-    Domain lifecycle after expiry:
-      1. Auto-Renew Grace Period: ~0-45 days (registrar-dependent)
-      2. Redemption Period: ~30 days
-      3. Pending Delete: ~5 days
-      4. Released to public
-    """
     if r.available is True or r.available is None:
         return ""
 
@@ -446,12 +652,11 @@ def _estimate_release(r: DomainResult) -> str:
     if "redemptionperiod" in statuses_lower:
         return "[yellow]~30-35 days[/yellow]"
 
-    # If expired but no transitional status yet, estimate from expiry date
     expiry = _parse_date(r.expiry_date)
     if expiry and expiry < datetime.now():
         days_expired = (datetime.now() - expiry).days
         if days_expired > 0:
-            remaining = max(0, 80 - days_expired)  # ~80 days total from expiry to drop
+            remaining = max(0, 80 - days_expired)
             if remaining > 0:
                 return f"[yellow]~{remaining} days[/yellow]"
             return "[bold yellow]any day now[/bold yellow]"
@@ -460,7 +665,6 @@ def _estimate_release(r: DomainResult) -> str:
 
 
 def _parse_date(date_str: str | None) -> datetime | None:
-    """Parse an ISO date string into a datetime."""
     if not date_str:
         return None
     try:
@@ -470,7 +674,6 @@ def _parse_date(date_str: str | None) -> datetime | None:
         return None
 
 
-# Status code explanations
 _STATUS_LEGEND: dict[str, str] = {
     "pendingdelete":              "Registry will delete and release in ~5 days",
     "redemptionperiod":           "Owner can still reclaim for a fee (~30 day window)",
@@ -496,7 +699,6 @@ _STATUS_LEGEND: dict[str, str] = {
 
 
 def _print_legend(statuses_seen: set[str], has_transitional: bool) -> None:
-    """Print a legend explaining the status codes that appeared in results."""
     relevant = {}
     for status in statuses_seen:
         normalized = status.lower().replace(" ", "")
@@ -519,7 +721,6 @@ def _print_legend(statuses_seen: set[str], has_transitional: bool) -> None:
 
 
 def _output_json(results: list[DomainResult], verbose: bool) -> None:
-    """Print results as JSON."""
     data = []
     for r in results:
         entry = {
@@ -542,7 +743,6 @@ def _output_json(results: list[DomainResult], verbose: bool) -> None:
 
 
 def _output_csv(results: list[DomainResult]) -> None:
-    """Print results as CSV."""
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(
@@ -567,10 +767,8 @@ def _output_csv(results: list[DomainResult]) -> None:
 
 
 def _format_date(date_str: str | None) -> str:
-    """Format an ISO date string for display."""
     if not date_str:
         return ""
-    # Truncate to date portion if it's a full ISO datetime
     if "T" in date_str:
         return date_str.split("T")[0]
     return date_str

@@ -55,6 +55,15 @@ python cli.py --suggest cloud --tlds com,io,dev --available-only
 
 # Pipe available suggestions as JSON
 python cli.py --suggest cloud --available-only --format json 2>/dev/null | jq '.[].domain'
+
+# Register an available domain via Porkbun (prompts for confirmation)
+python cli.py coolstartup.dev --register
+
+# Watch + auto-register when domain drops (with price cap)
+python cli.py expiring.com --watch 300 --register --auto-register --max-price 15
+
+# Suggest + register selected domains
+python cli.py --suggest cloud --tlds com,io,dev --register
 ```
 
 ## Example output
@@ -118,6 +127,55 @@ Available (10):
 
 All generation happens locally — no keyword ever leaves your machine. The candidates are checked through the same RDAP/WHOIS pipeline with per-server rate limiting.
 
+## Domain registration
+
+Register domains directly from the CLI via [Porkbun](https://porkbun.com/) (at-cost pricing, free WHOIS privacy, simple API).
+
+### Setup
+
+1. Create a Porkbun account and add credit at [porkbun.com](https://porkbun.com/)
+2. Register at least one domain manually (Porkbun API requirement)
+3. Get API keys at [porkbun.com/account/api](https://porkbun.com/account/api)
+4. Set credentials:
+
+```bash
+export PORKBUN_API_KEY="pk1_..."
+export PORKBUN_SECRET_KEY="sk1_..."
+```
+
+Or save to `~/.config/domain_search/config.json`:
+```json
+{"porkbun_api_key": "pk1_...", "porkbun_secret_key": "sk1_..."}
+```
+
+### Registration flags
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--register` | off | Enable registration for available domains |
+| `--auto-register` | off | Skip confirmation prompt (for unattended `--watch`) |
+| `--max-price N` | 20.00 | Max price in USD — refuses premium domains above this |
+
+### Safety
+
+- **Price check before every purchase.** The tool always checks the price via Porkbun's API before registering. If the price lookup fails, registration is refused.
+- **`--max-price` defaults to $20.** Premium domains that cost hundreds or thousands are automatically skipped unless you explicitly raise the limit.
+- **`--auto-register` is a separate flag.** You can't accidentally auto-purchase — it requires both `--register` and `--auto-register`.
+- **Credentials are never logged** or shown in `--verbose` output.
+
+### Works with all modes
+
+```bash
+# Check + register (prompts with price)
+python cli.py coolstartup.dev --register
+
+# Watch + auto-register on drop
+python cli.py expiring.com --watch 300 --register --auto-register --max-price 15
+
+# Suggest + select which to register
+python cli.py --suggest cloud --tlds com,io,dev --register
+```
+
 ## How it works
 
 1. **RDAP first.** Downloads the [IANA RDAP bootstrap file](https://data.iana.org/rdap/dns.json) to map TLDs to their authoritative RDAP servers. Caches locally for 24 hours. Queries return structured JSON with standardized status codes over HTTPS.
@@ -162,10 +220,12 @@ cli.py              CLI entry point, output formatting (table/json/csv)
 checker.py          Orchestrator: RDAP-first, WHOIS fallback, async bulk
 rdap.py             RDAP client, IANA bootstrap loading/caching
 whois_client.py     Raw TCP WHOIS (RFC 3912), heuristic response parsing
+registrar.py        Porkbun API client (pricing, registration)
+config.py           Credential loading (env vars, config file)
 suggest.py          Domain name generation engine (keyword → candidates)
 domain_parser.py    tldextract integration, IDN/punycode, input validation
 rate_limiter.py     Per-server async token bucket
-models.py           DomainResult dataclass
+models.py           DomainResult, PricingResult, RegistrationResult dataclasses
 constants.py        RDAP fallback map, WHOIS server directory, patterns
 ```
 
