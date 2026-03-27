@@ -110,18 +110,50 @@ class PorkbunClient:
             error=f"No Porkbun pricing available for .{tld} domains",
         )
 
-    async def register(self, domain: str, years: int = 1) -> RegistrationResult:
-        """Register a domain. Caller must confirm price first.
+    async def register(self, domain: str, price: float | None = None) -> RegistrationResult:
+        """Register a domain via Porkbun's domain/create endpoint.
+
+        Args:
+            domain: The domain to register.
+            price: Registration price in USD (from get_pricing). Required by
+                   Porkbun as confirmation — passed as cents in the `cost` field.
 
         Does NOT retry on failure — a 5xx doesn't guarantee the
         registration didn't succeed.
         """
-        url = f"{PORKBUN_API_BASE}/domain/register/{domain}"
-        body = {**self._auth, "years": years}
+        url = f"{PORKBUN_API_BASE}/domain/create/{domain}"
+
+        # Porkbun requires cost in pennies as confirmation
+        if price is None:
+            # Fetch price if not provided
+            pricing = await self.get_pricing(domain)
+            if pricing.error or pricing.registration_price is None:
+                return RegistrationResult(
+                    domain=domain,
+                    error=f"Cannot determine price: {pricing.error or 'no pricing data'}",
+                )
+            price = pricing.registration_price
+
+        cost_pennies = int(round(price * 100))
+        body = {
+            **self._auth,
+            "cost": cost_pennies,
+            "agreeToTerms": "yes",
+        }
 
         try:
             await self._rate_limiter.acquire(SERVER_KEY)
             async with self._session.post(url, json=body) as resp:
+                # Porkbun returns HTML on 404 (wrong endpoint), handle gracefully
+                content_type = resp.headers.get("Content-Type", "")
+                if "json" not in content_type:
+                    text = await resp.text()
+                    return RegistrationResult(
+                        domain=domain,
+                        success=False,
+                        error=f"Unexpected response (HTTP {resp.status}). Check Porkbun dashboard.",
+                    )
+
                 data = await resp.json()
 
                 if data.get("status") == "SUCCESS":
@@ -129,6 +161,7 @@ class PorkbunClient:
                         domain=domain,
                         success=True,
                         message=data.get("message", "Domain registered successfully"),
+                        price_paid=price,
                     )
 
                 return RegistrationResult(

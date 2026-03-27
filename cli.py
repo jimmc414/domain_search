@@ -280,8 +280,8 @@ async def _try_register(client, domain: str, max_price: float, auto: bool) -> bo
     else:
         console.print(f"  Auto-registering [cyan]{domain}[/cyan] for {price_info}...")
 
-    # Register
-    result = await client.register(domain)
+    # Register — pass price so Porkbun gets cost confirmation in pennies
+    result = await client.register(domain, price=price)
     if result.success:
         console.print(f"  [bold green]Registered {domain} for {price_info} via Porkbun[/bold green]")
         return True
