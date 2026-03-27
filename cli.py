@@ -11,7 +11,7 @@ import json
 import logging
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn
@@ -251,8 +251,11 @@ def _output_table(results: list[DomainResult], verbose: bool) -> None:
     table.add_column("Owner")
     table.add_column("Registrar")
     table.add_column("Expires (YYYY-MM-DD)")
+    table.add_column("Est. Release")
     table.add_column("Status")
     table.add_column("Via", style="dim")
+
+    has_transitional = False
 
     for r in results:
         if r.error:
@@ -269,6 +272,9 @@ def _output_table(results: list[DomainResult], verbose: bool) -> None:
             status = ""
 
         owner = _format_owner(r)
+        release = _estimate_release(r)
+        if release:
+            has_transitional = True
 
         table.add_row(
             r.domain,
@@ -276,11 +282,19 @@ def _output_table(results: list[DomainResult], verbose: bool) -> None:
             owner,
             r.registrar or "",
             _format_date(r.expiry_date),
+            release,
             status,
             r.protocol_used or "",
         )
 
     console.print(table)
+
+    # Print status legend if any domain has notable statuses
+    statuses_seen = set()
+    for r in results:
+        for s in r.statuses:
+            statuses_seen.add(s.lower().replace(" ", ""))
+    _print_legend(statuses_seen, has_transitional)
 
     if verbose:
         for r in results:
@@ -303,6 +317,98 @@ def _format_owner(r: DomainResult) -> str:
     if parts:
         return "\n".join(parts)
     return "[dim]hidden[/dim]"
+
+
+def _estimate_release(r: DomainResult) -> str:
+    """Estimate when a domain might become available based on status and expiry.
+
+    Domain lifecycle after expiry:
+      1. Auto-Renew Grace Period: ~0-45 days (registrar-dependent)
+      2. Redemption Period: ~30 days
+      3. Pending Delete: ~5 days
+      4. Released to public
+    """
+    if r.available is True or r.available is None:
+        return ""
+
+    statuses_lower = {s.lower().replace(" ", "") for s in r.statuses}
+
+    if "pendingdelete" in statuses_lower:
+        return "[bold yellow]~1-5 days[/bold yellow]"
+
+    if "redemptionperiod" in statuses_lower:
+        return "[yellow]~30-35 days[/yellow]"
+
+    # If expired but no transitional status yet, estimate from expiry date
+    expiry = _parse_date(r.expiry_date)
+    if expiry and expiry < datetime.now():
+        days_expired = (datetime.now() - expiry).days
+        if days_expired > 0:
+            remaining = max(0, 80 - days_expired)  # ~80 days total from expiry to drop
+            if remaining > 0:
+                return f"[yellow]~{remaining} days[/yellow]"
+            return "[bold yellow]any day now[/bold yellow]"
+
+    return ""
+
+
+def _parse_date(date_str: str | None) -> datetime | None:
+    """Parse an ISO date string into a datetime."""
+    if not date_str:
+        return None
+    try:
+        clean = date_str.split("T")[0] if "T" in date_str else date_str
+        return datetime.strptime(clean, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+# Status code explanations
+_STATUS_LEGEND: dict[str, str] = {
+    "pendingdelete":              "Registry will delete and release in ~5 days",
+    "redemptionperiod":           "Owner can still reclaim for a fee (~30 day window)",
+    "pendingrenew":               "Renewal initiated but not yet processed",
+    "pendingrestore":             "Owner is attempting to restore from redemption",
+    "pendingtransfer":            "Transfer to another registrar in progress",
+    "pendingcreate":              "Domain recently created, pending activation",
+    "pendingupdate":              "Update in progress at the registry",
+    "serverhold":                 "Registry has suspended resolution (may be reserved or policy hold)",
+    "clienthold":                 "Registrar has suspended resolution (often unpaid)",
+    "clientdeleteprohibited":     "Registrar lock: cannot be deleted",
+    "clienttransferprohibited":   "Registrar lock: cannot be transferred",
+    "clientupdateprohibited":     "Registrar lock: cannot be modified",
+    "serverdeleteprohibited":     "Registry lock: cannot be deleted",
+    "servertransferprohibited":   "Registry lock: cannot be transferred",
+    "serverupdateprohibited":     "Registry lock: cannot be modified",
+    "active":                     "Domain is registered and resolving normally",
+    "inactive":                   "Domain is registered but not resolving (no nameservers)",
+    "autorenewperiod":            "In auto-renewal grace period after expiry",
+    "addperiod":                  "Newly registered, within add grace period",
+    "transferperiod":             "Recently transferred, within transfer grace period",
+}
+
+
+def _print_legend(statuses_seen: set[str], has_transitional: bool) -> None:
+    """Print a legend explaining the status codes that appeared in results."""
+    relevant = {}
+    for status in statuses_seen:
+        normalized = status.lower().replace(" ", "")
+        if normalized in _STATUS_LEGEND:
+            relevant[normalized] = _STATUS_LEGEND[normalized]
+
+    if not relevant:
+        return
+
+    console.print()
+    console.print("[bold]Status legend:[/bold]")
+    for code, desc in sorted(relevant.items()):
+        console.print(f"  [dim]{code}[/dim] — {desc}")
+
+    if has_transitional:
+        console.print()
+        console.print(
+            "[dim]Est. Release is approximate. Actual timelines vary by registrar and TLD.[/dim]"
+        )
 
 
 def _output_json(results: list[DomainResult], verbose: bool) -> None:

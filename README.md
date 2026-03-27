@@ -101,7 +101,17 @@ For registered domains: registrant/owner (when visible), registrar, creation dat
 
 The **Owner** column shows the actual registrant name and organization when the registry exposes it. Most gTLD registrations post-GDPR show `PRIVATE` (behind a privacy proxy) or `hidden` (thin registry like Verisign where registrant data isn't in the response at all). Some ccTLDs (`.us`, `.uk`, `.au`) still expose registrant info.
 
-Domains in `redemptionPeriod` or `pendingDelete` are flagged — they're registered but may become available soon. Use `--watch` to monitor them.
+Domains in `redemptionPeriod` or `pendingDelete` are flagged — they're registered but may become available soon. The **Est. Release** column shows an approximate timeline based on the domain lifecycle:
+
+| Status | Meaning | Typical Timeline |
+|--------|---------|------------------|
+| `autoRenewPeriod` | Grace period after expiry, registrar can still renew | ~0-45 days after expiry |
+| `redemptionPeriod` | Owner can reclaim for a fee | ~30 days |
+| `pendingDelete` | Registry will delete and release | ~5 days |
+
+A **status legend** is printed below the table explaining every status code that appeared in the results.
+
+Use `--watch` to monitor transitional domains until they drop.
 
 ## Limitations
 

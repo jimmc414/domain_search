@@ -248,12 +248,7 @@ class WHOISClient:
         self, raw: str, name: str | None, org: str | None
     ) -> bool | None:
         """Detect privacy protection from WHOIS response."""
-        raw_lower = raw.lower()
-        # Check raw response for privacy service indicators
-        for pattern in PRIVACY_PATTERNS:
-            if pattern in raw_lower:
-                return True
-        # Check extracted fields
+        # Check extracted fields first — these are the most reliable signal
         if name and self._is_privacy_value(name):
             return True
         if org and self._is_privacy_value(org):
@@ -261,7 +256,26 @@ class WHOISClient:
         # If we have real registrant data, it's not private
         if name or org:
             return False
+        # No registrant fields extracted — check the registrant section of the
+        # raw response (NOT the full response, which includes legal disclaimers
+        # that often contain words like "privacy" in boilerplate text)
+        registrant_section = self._extract_registrant_section(raw)
+        if registrant_section:
+            section_lower = registrant_section.lower()
+            for pattern in PRIVACY_PATTERNS:
+                if pattern in section_lower:
+                    return True
         return None
+
+    def _extract_registrant_section(self, raw: str) -> str | None:
+        """Extract the registrant-related lines from WHOIS output."""
+        lines = raw.splitlines()
+        section_lines = []
+        for line in lines:
+            lower = line.lower().strip()
+            if lower.startswith("registrant") or lower.startswith("owner"):
+                section_lines.append(line)
+        return "\n".join(section_lines) if section_lines else None
 
     def _is_privacy_value(self, value: str) -> bool:
         """Check if a field value is a privacy redaction placeholder."""
