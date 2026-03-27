@@ -37,17 +37,20 @@ class PorkbunClient:
         return "PorkbunClient(authenticated=True)"
 
     async def ping(self) -> bool:
-        """Validate credentials by checking pricing for a known domain.
-
-        The Porkbun /ping endpoint doesn't reliably validate API keys,
-        so we use a pricing call against a known domain instead.
-        """
-        pricing = await self.get_pricing("google.com")
-        if pricing.error:
-            logger.warning("Porkbun auth check failed: %s", pricing.error)
+        """Validate credentials via the Porkbun /ping endpoint."""
+        url = f"{PORKBUN_API_BASE}/ping"
+        try:
+            await self._rate_limiter.acquire(SERVER_KEY)
+            async with self._session.post(url, json=self._auth) as resp:
+                data = await resp.json()
+                if data.get("status") == "SUCCESS":
+                    logger.debug("Porkbun ping successful")
+                    return True
+                logger.warning("Porkbun ping failed: %s", data.get("message", "unknown error"))
+                return False
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning("Porkbun ping error: %s", e)
             return False
-        logger.debug("Porkbun credentials validated via pricing check")
-        return True
 
     async def get_pricing(self, domain: str) -> PricingResult:
         """Get registration/renewal price for a domain."""
