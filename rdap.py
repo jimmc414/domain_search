@@ -15,6 +15,7 @@ from constants import (
     BOOTSTRAP_CACHE_TTL_HOURS,
     BOOTSTRAP_URL,
     CONNECT_TIMEOUT,
+    PRIVACY_PATTERNS,
     RDAP_FALLBACK,
     READ_TIMEOUT,
 )
@@ -26,6 +27,35 @@ logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(__file__).parent / "cache"
 BOOTSTRAP_CACHE = CACHE_DIR / "rdap_bootstrap.json"
+
+
+def _is_redacted(value: str) -> bool:
+    """Check if a value appears to be a privacy redaction placeholder."""
+    val = value.strip().lower()
+    if not val:
+        return True
+    for pattern in PRIVACY_PATTERNS:
+        if pattern in val:
+            return True
+    return False
+
+
+def _normalize_status(status: str) -> str:
+    """Normalize RDAP status values.
+
+    Handles both "client delete prohibited" and "clientDeleteProhibited".
+    Returns the spaced form for consistency.
+    """
+    if " " not in status and any(c.isupper() for c in status[1:]):
+        parts = re.findall(r"[a-z]+|[A-Z][a-z]*", status)
+        return " ".join(p.lower() for p in parts)
+    return status.lower()
+
+
+def _extract_host(url: str) -> str:
+    """Extract hostname from a URL for rate limiting."""
+    parsed = urlparse(url)
+    return parsed.hostname or url
 
 
 class RDAPClient:
@@ -245,7 +275,13 @@ class RDAPClient:
             _normalize_status(s) for s in data.get("status", [])
         ]
 
-        registrar = self._extract_registrar(data)
+        registrar = self._extract_entity_name(data, "registrar")
+        registrant_name = self._extract_entity_name(data, "registrant")
+        registrant_org = self._extract_entity_org(data, "registrant")
+
+        # Detect privacy protection
+        privacy = self._detect_privacy(data, registrant_name, registrant_org)
+
         creation_date = None
         expiry_date = None
 
@@ -261,6 +297,9 @@ class RDAPClient:
             domain=domain,
             available=False,
             registrar=registrar,
+            registrant_name=registrant_name,
+            registrant_org=registrant_org,
+            privacy_protected=privacy,
             creation_date=creation_date,
             expiry_date=expiry_date,
             statuses=statuses,
@@ -268,38 +307,82 @@ class RDAPClient:
             raw_response=raw[:5000],
         )
 
-    def _extract_registrar(self, data: dict[str, Any]) -> str | None:
-        """Extract registrar name from RDAP entities."""
+    def _extract_entity_name(
+        self, data: dict[str, Any], role: str
+    ) -> str | None:
+        """Extract entity name (fn) from RDAP entities by role."""
         for entity in data.get("entities", []):
             roles = entity.get("roles", [])
-            if "registrar" in roles:
-                # Try vcardArray first
+            if role in roles:
                 vcard = entity.get("vcardArray")
                 if vcard and len(vcard) > 1:
                     for field in vcard[1]:
                         if field[0] == "fn":
-                            return field[3]
-                # Fall back to handle
+                            val = field[3]
+                            if val and not _is_redacted(val):
+                                return val
                 handle = entity.get("handle")
-                if handle:
+                if handle and not _is_redacted(handle):
                     return handle
         return None
 
+    def _extract_entity_org(
+        self, data: dict[str, Any], role: str
+    ) -> str | None:
+        """Extract entity org from RDAP entities by role."""
+        for entity in data.get("entities", []):
+            roles = entity.get("roles", [])
+            if role in roles:
+                vcard = entity.get("vcardArray")
+                if vcard and len(vcard) > 1:
+                    for field in vcard[1]:
+                        if field[0] == "org":
+                            val = field[3]
+                            if val and not _is_redacted(val):
+                                return val
+        return None
 
-def _normalize_status(status: str) -> str:
-    """Normalize RDAP status values.
+    def _detect_privacy(
+        self,
+        data: dict[str, Any],
+        registrant_name: str | None,
+        registrant_org: str | None,
+    ) -> bool | None:
+        """Detect if domain registration uses privacy protection.
 
-    Handles both "client delete prohibited" and "clientDeleteProhibited".
-    Returns the spaced form for consistency.
-    """
-    # If camelCase, split on uppercase boundaries
-    if " " not in status and any(c.isupper() for c in status[1:]):
-        parts = re.findall(r"[a-z]+|[A-Z][a-z]*", status)
-        return " ".join(p.lower() for p in parts)
-    return status.lower()
+        Returns True if privacy proxy detected, False if registrant data
+        is clearly visible, None if can't determine.
+        """
+        # Check if any entity with registrant role has redacted remarks
+        for entity in data.get("entities", []):
+            roles = entity.get("roles", [])
+            if "registrant" in roles:
+                # Check remarks for redaction notices
+                for remark in entity.get("remarks", []):
+                    title = (remark.get("title") or "").lower()
+                    desc = " ".join(remark.get("description", [])).lower()
+                    if "redact" in title or "privacy" in title:
+                        return True
+                    if "redact" in desc or "privacy" in desc:
+                        return True
+
+                # Check if vcard data is redacted
+                vcard = entity.get("vcardArray")
+                if vcard and len(vcard) > 1:
+                    for field in vcard[1]:
+                        if field[0] == "fn":
+                            if _is_redacted(str(field[3])):
+                                return True
+
+                # If we found a registrant entity with real data, not private
+                if registrant_name or registrant_org:
+                    return False
+
+                # Registrant entity exists but no usable data
+                return True
+
+        # No registrant entity at all — most thick registries include one,
+        # so absence likely means redacted at the registry level
+        return None
 
 
-def _extract_host(url: str) -> str:
-    """Extract hostname from a URL for rate limiting."""
-    parsed = urlparse(url)
-    return parsed.hostname or url

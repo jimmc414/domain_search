@@ -7,6 +7,7 @@ import re
 from constants import (
     AVAILABLE_PATTERNS,
     CONNECT_TIMEOUT,
+    PRIVACY_PATTERNS,
     RATE_LIMIT_PATTERNS,
     READ_TIMEOUT,
     WHOIS_SERVERS,
@@ -174,6 +175,34 @@ class WHOISClient:
         registrar = self._extract_field(
             raw, [r"Registrar:\s*(.+)", r"registrar name:\s*(.+)"]
         )
+        registrant_name = self._extract_field(
+            raw,
+            [
+                r"Registrant Name:\s*(.+)",
+                r"Registrant:\s*(.+)",
+                r"registrant-name:\s*(.+)",
+                r"owner:\s*(.+)",
+            ],
+        )
+        registrant_org = self._extract_field(
+            raw,
+            [
+                r"Registrant Organization:\s*(.+)",
+                r"Registrant Organisation:\s*(.+)",
+                r"registrant-org:\s*(.+)",
+                r"org:\s*(.+)",
+            ],
+        )
+
+        # Detect privacy protection
+        privacy = self._detect_privacy(raw, registrant_name, registrant_org)
+
+        # Clear out redacted placeholder values
+        if registrant_name and self._is_privacy_value(registrant_name):
+            registrant_name = None
+        if registrant_org and self._is_privacy_value(registrant_org):
+            registrant_org = None
+
         creation_date = self._extract_field(
             raw,
             [
@@ -205,12 +234,42 @@ class WHOISClient:
             domain=domain,
             available=False,
             registrar=registrar,
+            registrant_name=registrant_name,
+            registrant_org=registrant_org,
+            privacy_protected=privacy,
             creation_date=creation_date,
             expiry_date=expiry_date,
             statuses=statuses,
             protocol_used="whois",
             raw_response=raw[:5000],
         )
+
+    def _detect_privacy(
+        self, raw: str, name: str | None, org: str | None
+    ) -> bool | None:
+        """Detect privacy protection from WHOIS response."""
+        raw_lower = raw.lower()
+        # Check raw response for privacy service indicators
+        for pattern in PRIVACY_PATTERNS:
+            if pattern in raw_lower:
+                return True
+        # Check extracted fields
+        if name and self._is_privacy_value(name):
+            return True
+        if org and self._is_privacy_value(org):
+            return True
+        # If we have real registrant data, it's not private
+        if name or org:
+            return False
+        return None
+
+    def _is_privacy_value(self, value: str) -> bool:
+        """Check if a field value is a privacy redaction placeholder."""
+        val = value.strip().lower()
+        for pattern in PRIVACY_PATTERNS:
+            if pattern in val:
+                return True
+        return False
 
     def _extract_field(
         self, raw: str, patterns: list[str]

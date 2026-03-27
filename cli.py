@@ -142,14 +142,15 @@ def _output_table(results: list[DomainResult], verbose: bool) -> None:
     table = Table(show_header=True, header_style="bold")
     table.add_column("Domain", style="cyan")
     table.add_column("Available")
+    table.add_column("Owner")
     table.add_column("Registrar")
-    table.add_column("Expires")
+    table.add_column("Expires (YYYY-MM-DD)")
     table.add_column("Status")
     table.add_column("Via", style="dim")
 
     for r in results:
         if r.error:
-            avail = f"[yellow]?[/yellow]"
+            avail = "[yellow]?[/yellow]"
             status = f"[red]{r.error}[/red]"
         elif r.available is True:
             avail = "[green]Yes[/green]"
@@ -161,9 +162,12 @@ def _output_table(results: list[DomainResult], verbose: bool) -> None:
             avail = "[yellow]?[/yellow]"
             status = ""
 
+        owner = _format_owner(r)
+
         table.add_row(
             r.domain,
             avail,
+            owner,
             r.registrar or "",
             _format_date(r.expiry_date),
             status,
@@ -179,6 +183,22 @@ def _output_table(results: list[DomainResult], verbose: bool) -> None:
                 console.print(r.raw_response)
 
 
+def _format_owner(r: DomainResult) -> str:
+    """Format the owner/registrant column."""
+    if r.available is True or r.available is None:
+        return ""
+    if r.privacy_protected is True:
+        return "[dim]PRIVATE[/dim]"
+    parts = []
+    if r.registrant_name:
+        parts.append(r.registrant_name)
+    if r.registrant_org and r.registrant_org != r.registrant_name:
+        parts.append(r.registrant_org)
+    if parts:
+        return "\n".join(parts)
+    return "[dim]hidden[/dim]"
+
+
 def _output_json(results: list[DomainResult], verbose: bool) -> None:
     """Print results as JSON."""
     data = []
@@ -186,6 +206,9 @@ def _output_json(results: list[DomainResult], verbose: bool) -> None:
         entry = {
             "domain": r.domain,
             "available": r.available,
+            "registrant_name": r.registrant_name,
+            "registrant_org": r.registrant_org,
+            "privacy_protected": r.privacy_protected,
             "registrar": r.registrar,
             "creation_date": r.creation_date,
             "expiry_date": r.expiry_date,
@@ -204,12 +227,16 @@ def _output_csv(results: list[DomainResult]) -> None:
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(
-        ["domain", "available", "registrar", "creation_date", "expiry_date", "statuses", "protocol", "error"]
+        ["domain", "available", "registrant_name", "registrant_org", "privacy_protected",
+         "registrar", "creation_date", "expiry_date", "statuses", "protocol", "error"]
     )
     for r in results:
         writer.writerow([
             r.domain,
             r.available,
+            r.registrant_name or "",
+            r.registrant_org or "",
+            r.privacy_protected if r.privacy_protected is not None else "",
             r.registrar or "",
             r.creation_date or "",
             r.expiry_date or "",

@@ -146,6 +146,31 @@ RATE_LIMIT_PATTERNS: list[str] = [
     "temporarily denied",
 ]
 
+# Patterns indicating WHOIS privacy/proxy protection (checked case-insensitively)
+PRIVACY_PATTERNS: list[str] = [
+    "redacted for privacy",
+    "data protected",
+    "domains by proxy",
+    "whoisguard",
+    "privacy service provided by",
+    "contact privacy inc",
+    "withheld for privacy",
+    "identity protection service",
+    "domain privacy group",
+    "whoisprivacyprotect",
+    "privacyguardian",
+    "perfect privacy",
+    "privacy protect",
+    "super privacy",
+    "domain protection services",
+    "statutorily masked",
+    "not disclosed",
+    "gdpr masked",
+    "gdpr redacted",
+    "is not shown",
+    "personal data not shown",
+]
+
 # RDAP bootstrap cache settings
 BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
 BOOTSTRAP_CACHE_TTL_HOURS = 24
