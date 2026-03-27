@@ -30,7 +30,9 @@ def main() -> None:
         epilog="Examples:\n"
         "  python cli.py example.com\n"
         "  python cli.py example.com example.org foo.co.uk\n"
-        '  python cli.py --file domains.txt --format json\n',
+        "  python cli.py --file domains.txt --format json\n"
+        "  python cli.py --suggest cloud\n"
+        '  python cli.py --suggest cloud --tlds com,io,dev\n',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -72,6 +74,22 @@ def main() -> None:
         metavar="SECONDS",
         help="Watch mode: re-check every N seconds until available, then alert (e.g. --watch 300)",
     )
+    parser.add_argument(
+        "--suggest", "-s",
+        type=str,
+        metavar="KEYWORD",
+        help="Generate and check domain names from a keyword (e.g. --suggest cloud)",
+    )
+    parser.add_argument(
+        "--tlds",
+        type=str,
+        help="Comma-separated TLDs for --suggest (default: com,io,dev,ai,co,app,...)",
+    )
+    parser.add_argument(
+        "--available-only",
+        action="store_true",
+        help="With --suggest, only show available domains",
+    )
 
     args = parser.parse_args()
 
@@ -88,16 +106,22 @@ def main() -> None:
             console.print(f"[red]File not found: {args.file}[/red]")
             sys.exit(1)
 
-    if not domains:
-        parser.print_help()
-        sys.exit(1)
-
     # Configure logging
     if args.verbose:
         logging.basicConfig(
             level=logging.DEBUG,
             format="%(name)s: %(message)s",
         )
+
+    if not domains and not args.suggest:
+        parser.print_help()
+        sys.exit(1)
+
+    # Suggest mode
+    if args.suggest:
+        tlds = args.tlds.split(",") if args.tlds else None
+        asyncio.run(_suggest(args.suggest, tlds, args.rate, args.format, args.verbose, args.available_only))
+        return
 
     # Watch mode
     if args.watch:
@@ -241,6 +265,89 @@ def _send_notification(domain: str) -> None:
         )
     except FileNotFoundError:
         pass
+
+
+async def _suggest(
+    keyword: str,
+    tlds: list[str] | None,
+    rate: float,
+    fmt: str,
+    verbose: bool,
+    available_only: bool,
+) -> None:
+    """Generate domain name candidates and check availability."""
+    from suggest import generate_candidates
+
+    candidates = generate_candidates(keyword, tlds=tlds)
+    tld_label = ",".join(tlds) if tlds else "popular TLDs"
+    # Use stderr for status messages so JSON/CSV stdout stays clean
+    err = Console(stderr=True) if fmt in ("json", "csv") else console
+    err.print(
+        f"[bold]Generating domains for [cyan]{keyword}[/cyan] "
+        f"across {tld_label} ({len(candidates)} candidates)...[/bold]\n"
+    )
+
+    results: list[DomainResult] = []
+    async with DomainChecker(rate=rate) as checker:
+        await checker._rdap.load_bootstrap()
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            console=err,
+        ) as progress:
+            task = progress.add_task(
+                "Checking availability", total=len(candidates)
+            )
+            async for result in checker.check_bulk(candidates):
+                results.append(result)
+                progress.update(task, advance=1)
+
+    # Sort: available first, then by domain length
+    results.sort(key=lambda r: (
+        0 if r.available is True else 1,
+        len(r.domain),
+        r.domain,
+    ))
+
+    if available_only:
+        results = [r for r in results if r.available is True]
+
+    if not results:
+        console.print("[yellow]No available domains found.[/yellow]")
+        return
+
+    if fmt == "json":
+        _output_json(results, verbose)
+    elif fmt == "csv":
+        _output_csv(results)
+    else:
+        # Compact table for suggest mode
+        available = [r for r in results if r.available is True]
+        taken = [r for r in results if r.available is not True]
+
+        if available:
+            console.print(f"[bold green]Available ({len(available)}):[/bold green]")
+            table = Table(show_header=False, box=None, padding=(0, 2))
+            table.add_column(style="green bold")
+            table.add_column(style="dim")
+            # Show in columns — group by base name
+            for r in available:
+                table.add_row(r.domain, r.protocol_used)
+            console.print(table)
+
+        if taken and not available_only:
+            console.print(f"\n[dim]Taken ({len(taken)}): {', '.join(r.domain for r in taken[:20])}", end="")
+            if len(taken) > 20:
+                console.print(f" ... and {len(taken) - 20} more", end="")
+            console.print("[/dim]")
+
+        if available:
+            console.print(
+                f"\n[bold]{len(available)} of {len(candidates)} "
+                f"candidates available[/bold]"
+            )
 
 
 def _output_table(results: list[DomainResult], verbose: bool) -> None:

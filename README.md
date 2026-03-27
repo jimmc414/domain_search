@@ -46,6 +46,15 @@ python cli.py --file domains.txt --rate 2
 
 # Watch a domain until it becomes available (check every 5 minutes)
 python cli.py expiring-domain.com --watch 300
+
+# Suggest available domains from a keyword
+python cli.py --suggest cloud
+
+# Suggest with specific TLDs, only show available
+python cli.py --suggest cloud --tlds com,io,dev --available-only
+
+# Pipe available suggestions as JSON
+python cli.py --suggest cloud --available-only --format json 2>/dev/null | jq '.[].domain'
 ```
 
 ## Example output
@@ -82,6 +91,32 @@ Watching getcounted.us every 5m. Ctrl+C to stop.
 ```
 
 Sends a Windows toast notification (WSL2) or `notify-send` (Linux desktop) when the domain becomes available.
+
+### Suggest mode
+
+Generate and check domain name variations from a keyword. Tries the bare keyword across popular TLDs, then common prefix/suffix patterns (get-, try-, -app, -hq, -lab, etc.), and filters to available domains:
+
+```
+$ python cli.py --suggest cloud --tlds com,io,dev --available-only
+
+Generating domains for cloud across com,io,dev (96 candidates)...
+
+Available (10):
+  cloud.dev        rdap
+  cloudgo.dev      rdap
+  oncloud.dev      rdap
+  clouddev.dev     rdap
+  getcloud.dev     rdap
+  heycloud.dev     rdap
+  thecloud.dev     rdap
+  trycloud.dev     rdap
+  joincloud.dev    rdap
+  withcloud.dev    rdap
+
+10 of 96 candidates available
+```
+
+All generation happens locally — no keyword ever leaves your machine. The candidates are checked through the same RDAP/WHOIS pipeline with per-server rate limiting.
 
 ## How it works
 
@@ -127,6 +162,7 @@ cli.py              CLI entry point, output formatting (table/json/csv)
 checker.py          Orchestrator: RDAP-first, WHOIS fallback, async bulk
 rdap.py             RDAP client, IANA bootstrap loading/caching
 whois_client.py     Raw TCP WHOIS (RFC 3912), heuristic response parsing
+suggest.py          Domain name generation engine (keyword → candidates)
 domain_parser.py    tldextract integration, IDN/punycode, input validation
 rate_limiter.py     Per-server async token bucket
 models.py           DomainResult dataclass
